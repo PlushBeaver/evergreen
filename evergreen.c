@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <stdbool.h>
+#include <sys/stat.h>
 
 int run_diagnostic(const char* self);
 int run_proxy(int argc, const char* argv[]);
@@ -17,8 +18,10 @@ enum Transfer transfer_data(int from, int to);
 int unpack_socket(struct msghdr* msg);
 struct Message* unpack_message(struct msghdr* msg);
 int send_message(int channel, struct Message* message, struct sockaddr_un* address);
-int receive_message(int channel, struct Message* message, struct sockaddr_un* address);
+int receive_message(int channel, struct Message* message, struct sockaddr_un* sender);
 
+bool
+is_fd_transferred(const struct Message* message);
 struct Proxy {
     int proxy_listener;
     int input;
@@ -41,6 +44,8 @@ enum Type {
 
 enum Command {
     COMMAND_GET_PID,
+    COMMAND_GET_API,
+    COMMAND_GET_LISTENER,
     COMMAND_GET_INPUT,
     COMMAND_GET_OUTPUT,
     COMMAND_SHUDOWN
@@ -51,13 +56,17 @@ struct Message {
     enum Command command;
     union {
         pid_t pid;
-        int input;
-        int output;
+        union { ;
+            int listener;
+            int input;
+            int output;
+            int fd;
+        };
     };
 };
 
 int
-main(int argc, char* argv[]) {
+main(int argc, const char* argv[]) {
     if ((argc < 2) || (strcmp(argv[1], "-h") == 0)) {
         return run_diagnostic(argv[0]);
     }
@@ -188,6 +197,7 @@ teardown_proxy(struct Proxy* proxy) {
     close(proxy->input);
     close(proxy->output);
     close(proxy->api);
+    unlink(proxy->api_address.sun_path);
 }
 
 int
@@ -195,6 +205,9 @@ handle_request(struct Proxy* proxy, struct Message* message) {
     switch (message->command) {
     case COMMAND_GET_PID:
         message->pid = getpid();
+        break;
+    case COMMAND_GET_LISTENER:
+        message->listener = proxy->proxy_listener;
         break;
     case COMMAND_GET_INPUT:
         message->input = proxy->input;
@@ -214,42 +227,7 @@ handle_request(struct Proxy* proxy, struct Message* message) {
 int
 serve_api(struct Proxy* proxy) {
     struct Message message;
-
-//    struct msghdr msg;
-//    memset(&msg, 0, sizeof(msg));
-//
-//    struct iovec iov;
-//    iov.iov_base = &message;
-//    iov.iov_len = sizeof(message);
-//    msg.msg_iov = &iov;
-//    msg.msg_iovlen = 1;
-
     struct sockaddr_un peer;
-//    memset(&peer, 0, sizeof(peer));
-//    peer.sun_family = AF_UNIX;
-//    msg.msg_name = &peer;
-//    msg.msg_namelen = sizeof(peer);
-//
-//    if (recvmsg(proxy->api, &msg, 0) < 0) {
-//        perror("error: api: recvmsg");
-//        return EXIT_FAILURE;
-//    }
-//
-//    if (msg.msg_iovlen != 1) {
-//        fprintf(stderr, "warning: api: (msg_iovlen == %lu) != 1\n",
-//                msg.msg_iovlen);
-//        return EXIT_SUCCESS;
-//    }
-//    if (msg.msg_iov[0].iov_len != sizeof(struct Message)) {
-//        fprintf(stderr, "warning: api: (msg_iov[0].iov_len == %lu) != %lu\n",
-//                msg.msg_iov[0].iov_len, sizeof(struct Message));
-//        return EXIT_SUCCESS;
-//    }
-//
-//    char control[CMSG_LEN(sizeof(int))];
-//    memset(&control, 0, sizeof(control));
-//    msg.msg_control = &control;
-//    msg.msg_controllen = CMSG_LEN(sizeof(int));
 
     receive_message(proxy->api, &message, &peer);
 
@@ -258,10 +236,6 @@ serve_api(struct Proxy* proxy) {
         return EXIT_FAILURE;
     }
 
-
-//    msg.msg_name = &peer;
-//    msg.msg_namelen = sizeof(peer);
-//    if (sendmsg(proxy->api, &msg, 0) < 0) {
     message.type = MESSAGE_RESPONSE;
     if (send_message(proxy->api, &message, &peer)) {
         perror("api: sendmsg");
@@ -381,10 +355,9 @@ unpack_message(struct msghdr* msg) {
     }
     switch (message->command) {
     case COMMAND_GET_INPUT:
-        message->input = unpack_socket(msg);
-        break;
     case COMMAND_GET_OUTPUT:
-        message->output = unpack_socket(msg);
+    case COMMAND_GET_LISTENER:
+        message->fd = unpack_socket(msg);
         break;
     }
     return message;
@@ -397,10 +370,9 @@ pack_message(struct Message* message, struct msghdr* msg) {
     }
     switch (message->command) {
     case COMMAND_GET_INPUT:
-        pack_socket(msg, message->input);
-        break;
     case COMMAND_GET_OUTPUT:
-        pack_socket(msg, message->output);
+    case COMMAND_GET_LISTENER:
+        pack_socket(msg, message->fd);
         break;
     }
 }
@@ -422,8 +394,7 @@ send_message(int channel, struct Message* message, struct sockaddr_un* address) 
     msg.msg_namelen = sizeof(*address);
 
     if (message->type == MESSAGE_RESPONSE) {
-        if ((message->command == COMMAND_GET_INPUT) ||
-                (message->command == COMMAND_GET_OUTPUT)) {
+        if (is_fd_transferred(message)) {
             memset(&control, 0, sizeof(control));
             msg.msg_control = control;
             msg.msg_controllen = CMSG_LEN(sizeof(int));
@@ -456,8 +427,7 @@ receive_message(int channel, struct Message* message, struct sockaddr_un* sender
         msg.msg_namelen = sizeof(*sender);
     }
 
-    const bool has_attachment = (message->command == COMMAND_GET_INPUT) ||
-            (message->command == COMMAND_GET_OUTPUT);
+    const bool has_attachment = is_fd_transferred(message);
     if (has_attachment) {
         memset(&control, 0, sizeof(control));
         msg.msg_control = control;
@@ -470,6 +440,34 @@ receive_message(int channel, struct Message* message, struct sockaddr_un* sender
     }
     unpack_message(&msg);
     return EXIT_SUCCESS;
+}
+
+bool
+is_fd_transferred(const struct Message* message) {
+    const bool has_attachment = (message->command == COMMAND_GET_INPUT) ||
+            (message->command == COMMAND_GET_OUTPUT) ||
+            (message->command == COMMAND_GET_LISTENER);
+    return has_attachment;
+}
+
+int
+request(int channel, struct sockaddr_un* address,
+        enum Command command, struct Message* message) {
+    message->type = MESSAGE_REQUEST;
+    message->command = command;
+    if (send_message(channel, message, address) != EXIT_SUCCESS) {
+        return EXIT_FAILURE;
+    }
+    return receive_message(channel, message, NULL);
+}
+
+int
+request_fd(int channel, struct sockaddr_un* address,
+        enum Command command, struct Message* message) {
+    if (request(channel, address, command, message) != EXIT_SUCCESS) {
+        return -1;
+    }
+    return message->fd;
 }
 
 int
@@ -499,18 +497,49 @@ run_update(int argc, const char** argv) {
     address.sun_family = AF_UNIX;
     strcpy(address.sun_path, api_path);
 
-    fprintf(stderr, "update: debug: retrieving input socket...\n");
-    message.type = MESSAGE_REQUEST;
-    message.command = COMMAND_GET_INPUT;
-    send_message(api, &message, &address);
+    struct Proxy proxy;
 
-    receive_message(api, &message, NULL);
-    fprintf(stderr, "update: debug: input socket is %d\n", message.input);
+    proxy.proxy_listener = request_fd(api, &address, COMMAND_GET_LISTENER, &message);
+    proxy.input = request_fd(api, &address, COMMAND_GET_INPUT, &message);
+    proxy.output = request_fd(api, &address, COMMAND_GET_OUTPUT, &message);
 
-    if (send(message.input, "MITM?!\n", 7, 0) != 7) {
-        perror("update: send");
+    fprintf(stderr, "debug: update: proxy_listener=%d\n", proxy.proxy_listener);
+    fprintf(stderr, "debug: update: input=%d\n", proxy.input);
+    fprintf(stderr, "debug: update: output=%d\n", proxy.output);
+
+    struct sockaddr_in proxy_address;
+    socklen_t proxy_address_length = sizeof(proxy_address);
+    if (getsockname(proxy.proxy_listener, (struct sockaddr*)&proxy_address,
+            &proxy_address_length) < 0) {
+        perror("getsockname");
+    } else {
+        fprintf(stderr, "proxy address: %s:%d\n", inet_ntoa(proxy_address.sin_addr),
+                ntohs(proxy_address.sin_port));
     }
 
+    message.type = MESSAGE_REQUEST;
+    message.command = COMMAND_SHUDOWN;
+    send_message(api, &message, &address);
+
     close(api);
+
+    fprintf(stderr, "info: waiting for API socket to be freed...\n");
+    do {
+        struct stat info;
+        if (stat(api_path, &info) < 0) {
+            if (errno == ENOENT) {
+                break;
+            }
+            perror("stat");
+            teardown_proxy(&proxy);
+            return EXIT_FAILURE;
+        }
+        sleep(1);
+    } while (true);
+
+    fprintf(stderr, "info: restoring operations\n");
+    setup_api(api_path, &proxy);
+    proxy_data(&proxy);
+    teardown_proxy(&proxy);
     return EXIT_SUCCESS;
 }
