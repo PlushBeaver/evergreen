@@ -8,11 +8,16 @@
 #include <stdio.h>
 #include <errno.h>
 #include <poll.h>
+#include <stdbool.h>
 
 int run_diagnostic(const char* self);
 int run_proxy(int argc, const char* argv[]);
 int run_update(int argc, const char* argv[]);
 enum Transfer transfer_data(int from, int to);
+int unpack_socket(struct msghdr* msg);
+struct Message* unpack_message(struct msghdr* msg);
+int send_message(int channel, struct Message* message, struct sockaddr_un* address);
+int receive_message(int channel, struct Message* message, struct sockaddr_un* address);
 
 struct Proxy {
     int proxy_listener;
@@ -29,20 +34,20 @@ enum Transfer {
     TRANSFER_FAILED
 };
 
-enum Action {
-    ACTION_REQUEST,
-    ACTION_RESPONSE
+enum Type {
+    MESSAGE_REQUEST,
+    MESSAGE_RESPONSE
 };
 
 enum Command {
     COMMAND_GET_PID,
     COMMAND_GET_INPUT,
     COMMAND_GET_OUTPUT,
-    COMMAND_SHUDOWN_
+    COMMAND_SHUDOWN
 };
 
 struct Message {
-    enum Action action;
+    enum Type type;
     enum Command command;
     union {
         pid_t pid;
@@ -168,66 +173,97 @@ setup_proxy(uint16_t from_port, uint16_t to_port, const char* api, struct Proxy*
     return EXIT_SUCCESS;
 }
 
+void
+pack_socket(struct msghdr* msg, int fd) {
+    struct cmsghdr* control = msg->msg_control;
+    control->cmsg_level = SOL_SOCKET;
+    control->cmsg_type = SCM_RIGHTS;
+    control->cmsg_len = CMSG_LEN(sizeof(int));
+    *((int*)CMSG_DATA(control)) = fd;
+}
+
+void
+teardown_proxy(struct Proxy* proxy) {
+    close(proxy->proxy_listener);
+    close(proxy->input);
+    close(proxy->output);
+    close(proxy->api);
+}
+
 int
-handle_request(struct Message* message, struct msghdr* msg) {
+handle_request(struct Proxy* proxy, struct Message* message) {
     switch (message->command) {
     case COMMAND_GET_PID:
         message->pid = getpid();
         break;
+    case COMMAND_GET_INPUT:
+        message->input = proxy->input;
+        break;
+    case COMMAND_GET_OUTPUT:
+        message->output = proxy->output;
+        break;
+    case COMMAND_SHUDOWN:
+        teardown_proxy(proxy);
+        exit(EXIT_SUCCESS);
     default:
-        fprintf(stderr, "error: api: method not implemented\n");
-        return EXIT_SUCCESS;
+        fprintf(stderr, "error: api: method %d not implemented\n", message->command);
     }
+    return EXIT_SUCCESS;
 }
 
 int
 serve_api(struct Proxy* proxy) {
     struct Message message;
 
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
-
-    struct iovec iov;
-    iov.iov_base = &message;
-    iov.iov_len = sizeof(message);
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-
-    struct cmsghdr control;
-    memset(&control, 0, sizeof(control));
-    msg.msg_control = &control;
-    msg.msg_controllen = CMSG_LEN(0);
+//    struct msghdr msg;
+//    memset(&msg, 0, sizeof(msg));
+//
+//    struct iovec iov;
+//    iov.iov_base = &message;
+//    iov.iov_len = sizeof(message);
+//    msg.msg_iov = &iov;
+//    msg.msg_iovlen = 1;
 
     struct sockaddr_un peer;
-    memset(&peer, 0, sizeof(peer));
-    peer.sun_family = AF_UNIX;
-    msg.msg_name = &peer;
-    msg.msg_namelen = sizeof(peer);
+//    memset(&peer, 0, sizeof(peer));
+//    peer.sun_family = AF_UNIX;
+//    msg.msg_name = &peer;
+//    msg.msg_namelen = sizeof(peer);
+//
+//    if (recvmsg(proxy->api, &msg, 0) < 0) {
+//        perror("error: api: recvmsg");
+//        return EXIT_FAILURE;
+//    }
+//
+//    if (msg.msg_iovlen != 1) {
+//        fprintf(stderr, "warning: api: (msg_iovlen == %lu) != 1\n",
+//                msg.msg_iovlen);
+//        return EXIT_SUCCESS;
+//    }
+//    if (msg.msg_iov[0].iov_len != sizeof(struct Message)) {
+//        fprintf(stderr, "warning: api: (msg_iov[0].iov_len == %lu) != %lu\n",
+//                msg.msg_iov[0].iov_len, sizeof(struct Message));
+//        return EXIT_SUCCESS;
+//    }
+//
+//    char control[CMSG_LEN(sizeof(int))];
+//    memset(&control, 0, sizeof(control));
+//    msg.msg_control = &control;
+//    msg.msg_controllen = CMSG_LEN(sizeof(int));
 
-    if (recvmsg(proxy->api, &msg, 0) < 0) {
-        perror("error: api: recvmsg");
-        return EXIT_FAILURE;
-    }
+    receive_message(proxy->api, &message, &peer);
 
-    if (msg.msg_iovlen != 1) {
-        fprintf(stderr, "warning: api: (msg_iovlen == %lu) != 1\n",
-                msg.msg_iovlen);
-        return EXIT_SUCCESS;
-    }
-    if (msg.msg_iov[0].iov_len != sizeof(struct Message)) {
-        fprintf(stderr, "warning: api: (msg_iov[0].iov_len == %lu) != %lu\n",
-                msg.msg_iov[0].iov_len, sizeof(struct Message));
-        return EXIT_SUCCESS;
-    }
-
-    if (handle_request(&message, &msg) != EXIT_SUCCESS) {
+    if (handle_request(proxy, &message) != EXIT_SUCCESS) {
         fprintf(stderr, "error: api: unable to handle request\n");
         return EXIT_FAILURE;
     }
 
-    msg.msg_name = &peer;
-    msg.msg_namelen = sizeof(peer);
-    if (sendmsg(proxy->api, &msg, 0) < 0) {
+
+//    msg.msg_name = &peer;
+//    msg.msg_namelen = sizeof(peer);
+//    if (sendmsg(proxy->api, &msg, 0) < 0) {
+    message.type = MESSAGE_RESPONSE;
+    if (send_message(proxy->api, &message, &peer)) {
         perror("api: sendmsg");
         return EXIT_FAILURE;
     }
@@ -328,10 +364,112 @@ run_proxy(int argc, const char** argv) {
         return EXIT_FAILURE;
     }
     proxy_data(&proxy);
-    close(proxy.proxy_listener);
-    close(proxy.input);
-    close(proxy.output);
-    close(proxy.api);
+    teardown_proxy(&proxy);
+}
+
+int
+unpack_socket(struct msghdr* msg) {
+    struct cmsghdr* control = msg->msg_control;
+    return *(int*)CMSG_DATA(control);
+}
+
+struct Message*
+unpack_message(struct msghdr* msg) {
+    struct Message* message = (struct Message*)msg->msg_iov[0].iov_base;
+    if (message->type != MESSAGE_RESPONSE) {
+        return message;
+    }
+    switch (message->command) {
+    case COMMAND_GET_INPUT:
+        message->input = unpack_socket(msg);
+        break;
+    case COMMAND_GET_OUTPUT:
+        message->output = unpack_socket(msg);
+        break;
+    }
+    return message;
+}
+
+void
+pack_message(struct Message* message, struct msghdr* msg) {
+    if (message->type != MESSAGE_RESPONSE) {
+        return;
+    }
+    switch (message->command) {
+    case COMMAND_GET_INPUT:
+        pack_socket(msg, message->input);
+        break;
+    case COMMAND_GET_OUTPUT:
+        pack_socket(msg, message->output);
+        break;
+    }
+}
+
+int
+send_message(int channel, struct Message* message, struct sockaddr_un* address) {
+    struct msghdr msg;
+    char control[CMSG_LEN(sizeof(int))];
+
+    memset(&msg, 0, sizeof(msg));
+
+    struct iovec iov;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_iov[0].iov_base = message;
+    msg.msg_iov[0].iov_len = sizeof(*message);
+
+    msg.msg_name = address;
+    msg.msg_namelen = sizeof(*address);
+
+    if (message->type == MESSAGE_RESPONSE) {
+        if ((message->command == COMMAND_GET_INPUT) ||
+                (message->command == COMMAND_GET_OUTPUT)) {
+            memset(&control, 0, sizeof(control));
+            msg.msg_control = control;
+            msg.msg_controllen = CMSG_LEN(sizeof(int));
+        }
+    }
+
+    pack_message(message, &msg);
+    if (sendmsg(channel, &msg, 0) < 0) {
+        perror("update: error: sendmsg");
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int
+receive_message(int channel, struct Message* message, struct sockaddr_un* sender) {
+    struct msghdr msg;
+    char control[CMSG_LEN(sizeof(int))];
+
+    memset(&msg, 0, sizeof(msg));
+
+    struct iovec iov;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_iov[0].iov_base = message;
+    msg.msg_iov[0].iov_len = sizeof(struct Message);
+
+    if (sender != NULL) {
+        msg.msg_name = sender;
+        msg.msg_namelen = sizeof(*sender);
+    }
+
+    const bool has_attachment = (message->command == COMMAND_GET_INPUT) ||
+            (message->command == COMMAND_GET_OUTPUT);
+    if (has_attachment) {
+        memset(&control, 0, sizeof(control));
+        msg.msg_control = control;
+        msg.msg_controllen = CMSG_LEN(sizeof(int));
+    }
+
+    if (recvmsg(channel, &msg, 0) < 0) {
+        perror("update: error: recvmsg");
+        return EXIT_FAILURE;
+    }
+    unpack_message(&msg);
+    return EXIT_SUCCESS;
 }
 
 int
@@ -356,39 +494,22 @@ run_update(int argc, const char** argv) {
         return EXIT_FAILURE;
     }
 
-    fprintf(stderr, "debug: requesting PID via API\n");
-
     struct Message message;
-
-    message.command = COMMAND_GET_PID;
-
-    struct msghdr msg;
-    memset(&msg, 0, sizeof(msg));
-
-    struct iovec iov;
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-    msg.msg_iov[0].iov_base = &message;
-    msg.msg_iov[0].iov_len = sizeof(message);
 
     address.sun_family = AF_UNIX;
     strcpy(address.sun_path, api_path);
-    msg.msg_name = &address;
-    msg.msg_namelen = sizeof(address);
 
-    if (sendmsg(api, &msg, 0) < 0) {
-        perror("update: sendmsg");
-        return EXIT_FAILURE;
+    fprintf(stderr, "update: debug: retrieving input socket...\n");
+    message.type = MESSAGE_REQUEST;
+    message.command = COMMAND_GET_INPUT;
+    send_message(api, &message, &address);
+
+    receive_message(api, &message, NULL);
+    fprintf(stderr, "update: debug: input socket is %d\n", message.input);
+
+    if (send(message.input, "MITM?!\n", 7, 0) != 7) {
+        perror("update: send");
     }
-
-    fprintf(stderr, "debug: waiting for response with PID\n");
-
-    if (recvmsg(api, &msg, 0) != sizeof(message)) {
-        perror("update: recvmsg");
-        return EXIT_FAILURE;
-    }
-
-    fprintf(stderr, "debug: received PID: %d\n", message.pid);
 
     close(api);
     return EXIT_SUCCESS;
