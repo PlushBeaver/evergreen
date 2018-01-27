@@ -1,6 +1,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <sys/un.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -11,6 +12,16 @@
 int run_diagnostic(const char* self);
 int run_proxy(int argc, const char* argv[]);
 int run_update(int argc, const char* argv[]);
+enum Transfer transfer_data(int from, int to);
+
+struct Proxy {
+    int proxy_listener;
+    int input;
+    int output;
+    struct sockaddr_in input_peer;
+    int api;
+    struct sockaddr_un api_address;
+};
 
 enum Transfer {
     TRANSFER_OK,
@@ -18,8 +29,27 @@ enum Transfer {
     TRANSFER_FAILED
 };
 
+enum Action {
+    ACTION_REQUEST,
+    ACTION_RESPONSE
+};
 
-enum Transfer transfer_data(int from, int to);
+enum Command {
+    COMMAND_GET_PID,
+    COMMAND_GET_INPUT,
+    COMMAND_GET_OUTPUT,
+    COMMAND_SHUDOWN_
+};
+
+struct Message {
+    enum Action action;
+    enum Command command;
+    union {
+        pid_t pid;
+        int input;
+        int output;
+    };
+};
 
 int
 main(int argc, char* argv[]) {
@@ -39,8 +69,8 @@ int
 run_diagnostic(const char* self) {
     const char* message =
             "Usage:\n"
-                    "\t%s proxy FROM-PORT TO-PORT\n"
-                    "\t%s update PID\n";
+                    "\t%s proxy FROM-PORT TO-PORT API-SOCKET\n"
+                    "\t%s update API-SOCKET\n";
     fprintf(stderr, message, self, self);
     return EXIT_FAILURE;
 }
@@ -54,17 +84,36 @@ parse_port(const char* text) {
     return (uint16_t)port;
 }
 
-struct Proxy {
-    int listener;
-    int input;
-    int output;
-    struct sockaddr_in input_peer;
-};
+int
+setup_api(const char* path, struct Proxy* proxy) {
+    proxy->api = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (proxy->api == -1) {
+        perror("error: unable: to allocate API socket");
+        return EXIT_FAILURE;
+    }
+
+    memset(&proxy->api_address, 0, sizeof(proxy->api_address));
+    proxy->api_address.sun_family = AF_UNIX;
+    strcpy(proxy->api_address.sun_path, path);
+
+    if (bind(proxy->api, (const struct sockaddr*)&proxy->api_address,
+            sizeof(proxy->api_address)) < 0) {
+        perror("error: api: bind");
+        return EXIT_FAILURE;
+    }
+
+    return EXIT_SUCCESS;
+}
 
 int
-setup_proxy(uint16_t from_port, uint16_t to_port, struct Proxy* proxy) {
-    proxy->listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (proxy->listener == -1) {
+setup_proxy(uint16_t from_port, uint16_t to_port, const char* api, struct Proxy* proxy) {
+    if (setup_api(api, proxy) != EXIT_SUCCESS) {
+        fprintf(stderr, "fatal: proxy: API setup failed\n");
+        return EXIT_FAILURE;
+    }
+
+    proxy->proxy_listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (proxy->proxy_listener == -1) {
         perror("error: unable to allocate socket");
         return EXIT_FAILURE;
     }
@@ -75,19 +124,21 @@ setup_proxy(uint16_t from_port, uint16_t to_port, struct Proxy* proxy) {
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(from_port);
 
-    if (bind(proxy->listener, (const struct sockaddr*)&address, sizeof(address)) < 0) {
+    if (bind(proxy->proxy_listener, (const struct sockaddr*)&address,
+            sizeof(address)) < 0) {
         perror("error: unable to bind to address");
         return EXIT_FAILURE;
     }
 
-    if (listen(proxy->listener, 1) < 0) {
+    if (listen(proxy->proxy_listener, 1) < 0) {
         perror("error: unable to listen for connections");
         return EXIT_FAILURE;
     }
 
     socklen_t peer_length = sizeof(proxy->input_peer);
     memset(&proxy->input_peer, 0, peer_length);
-    proxy->input = accept(proxy->listener, (struct sockaddr*)&proxy->input_peer, &peer_length);
+    proxy->input = accept(proxy->proxy_listener, (struct sockaddr*)&proxy->input_peer,
+            &peer_length);
     if (proxy->input == -1) {
         perror("error: unable to accept connection");
         return EXIT_FAILURE;
@@ -118,29 +169,105 @@ setup_proxy(uint16_t from_port, uint16_t to_port, struct Proxy* proxy) {
 }
 
 int
+handle_request(struct Message* message, struct msghdr* msg) {
+    switch (message->command) {
+    case COMMAND_GET_PID:
+        message->pid = getpid();
+        break;
+    default:
+        fprintf(stderr, "error: api: method not implemented\n");
+        return EXIT_SUCCESS;
+    }
+}
+
+int
+serve_api(struct Proxy* proxy) {
+    struct Message message;
+
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+
+    struct iovec iov;
+    iov.iov_base = &message;
+    iov.iov_len = sizeof(message);
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+
+    struct cmsghdr control;
+    memset(&control, 0, sizeof(control));
+    msg.msg_control = &control;
+    msg.msg_controllen = CMSG_LEN(0);
+
+    struct sockaddr_un peer;
+    memset(&peer, 0, sizeof(peer));
+    peer.sun_family = AF_UNIX;
+    msg.msg_name = &peer;
+    msg.msg_namelen = sizeof(peer);
+
+    if (recvmsg(proxy->api, &msg, 0) < 0) {
+        perror("error: api: recvmsg");
+        return EXIT_FAILURE;
+    }
+
+    if (msg.msg_iovlen != 1) {
+        fprintf(stderr, "warning: api: (msg_iovlen == %lu) != 1\n",
+                msg.msg_iovlen);
+        return EXIT_SUCCESS;
+    }
+    if (msg.msg_iov[0].iov_len != sizeof(struct Message)) {
+        fprintf(stderr, "warning: api: (msg_iov[0].iov_len == %lu) != %lu\n",
+                msg.msg_iov[0].iov_len, sizeof(struct Message));
+        return EXIT_SUCCESS;
+    }
+
+    if (handle_request(&message, &msg) != EXIT_SUCCESS) {
+        fprintf(stderr, "error: api: unable to handle request\n");
+        return EXIT_FAILURE;
+    }
+
+    msg.msg_name = &peer;
+    msg.msg_namelen = sizeof(peer);
+    if (sendmsg(proxy->api, &msg, 0) < 0) {
+        perror("api: sendmsg");
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int
 proxy_data(struct Proxy* proxy) {
-    const int COUNT = 2;
+    const int COUNT = 3;
     struct pollfd polled[COUNT];
     polled[0].fd = proxy->input;
     polled[0].events = POLLIN | POLLERR;
     polled[1].fd = proxy->output;
     polled[1].events = POLLIN | POLLERR;
+    polled[2].fd = proxy->api;
+    polled[2].events = POLLIN | POLLERR;
 
     int result = 0;
     while ((result = poll(polled, COUNT, -1)) > 0) {
         for (int i = 0; i < COUNT; i++) {
-            if (polled[i].revents & POLLIN) {
-                result = transfer_data(polled[i].fd, polled[1 - i].fd);
-                if (result != 0) {
-                    return result;
-                }
-            }
             if (polled[i].revents & POLLERR) {
                 int error = EXIT_SUCCESS;
                 socklen_t error_size = sizeof(error);
                 getsockopt(polled[i].fd, SOL_SOCKET, SO_ERROR, &error, &error_size);
                 fprintf(stderr, "error: %s (%d)", strerror(error), error);
                 return EXIT_FAILURE;
+            }
+            if (polled[i].revents & POLLIN) {
+                switch (i) {
+                case 0:
+                case 1:
+                    result = transfer_data(polled[i].fd, polled[1 - i].fd);
+                    if (result != 0) {
+                        return result;
+                    }
+                    break;
+                case 2:
+                    result = serve_api(proxy);
+                    break;
+                }
             }
         }
     }
@@ -182,7 +309,7 @@ transfer_data(int from, int to) {
 
 int
 run_proxy(int argc, const char** argv) {
-    if (argc != 4) {
+    if (argc != 5) {
         return run_diagnostic(argv[0]);
     }
 
@@ -193,19 +320,76 @@ run_proxy(int argc, const char** argv) {
         return run_diagnostic(argv[0]);
     }
 
+    const char* api = argv[4];
+
     struct Proxy proxy;
-    if (setup_proxy(from_port, to_port, &proxy) != 0) {
+    if (setup_proxy(from_port, to_port, api, &proxy) != 0) {
         fprintf(stderr, "fatal: failed to setup proxy\n");
         return EXIT_FAILURE;
     }
     proxy_data(&proxy);
-    close(proxy.listener);
+    close(proxy.proxy_listener);
     close(proxy.input);
     close(proxy.output);
+    close(proxy.api);
 }
 
 int
 run_update(int argc, const char** argv) {
-    fprintf(stderr, "%s: fatal: not implemented\n", argv[0]);
-    return EXIT_FAILURE;
+    if (argc != 3) {
+        return run_diagnostic(argv[0]);
+    }
+    const char* api_path = argv[2];
+
+    int api = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (api == -1) {
+        perror("update: socket");
+        return EXIT_FAILURE;
+    }
+
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+
+    if (bind(api, (const struct sockaddr*)&address, sizeof(address)) < 0) {
+        perror("update: bind");
+        return EXIT_FAILURE;
+    }
+
+    fprintf(stderr, "debug: requesting PID via API\n");
+
+    struct Message message;
+
+    message.command = COMMAND_GET_PID;
+
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+
+    struct iovec iov;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_iov[0].iov_base = &message;
+    msg.msg_iov[0].iov_len = sizeof(message);
+
+    address.sun_family = AF_UNIX;
+    strcpy(address.sun_path, api_path);
+    msg.msg_name = &address;
+    msg.msg_namelen = sizeof(address);
+
+    if (sendmsg(api, &msg, 0) < 0) {
+        perror("update: sendmsg");
+        return EXIT_FAILURE;
+    }
+
+    fprintf(stderr, "debug: waiting for response with PID\n");
+
+    if (recvmsg(api, &msg, 0) != sizeof(message)) {
+        perror("update: recvmsg");
+        return EXIT_FAILURE;
+    }
+
+    fprintf(stderr, "debug: received PID: %d\n", message.pid);
+
+    close(api);
+    return EXIT_SUCCESS;
 }
