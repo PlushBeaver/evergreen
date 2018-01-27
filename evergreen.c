@@ -11,6 +11,17 @@
 #include <stdbool.h>
 #include <sys/stat.h>
 
+struct Proxy {
+    uint16_t from_port;
+    uint16_t to_port;
+    int proxy_listener;
+    int input;
+    int output;
+    struct sockaddr_in input_peer;
+    int api;
+    struct sockaddr_un api_address;
+};
+
 int run_diagnostic(const char* self);
 int run_proxy(int argc, const char* argv[]);
 int run_update(int argc, const char* argv[]);
@@ -19,17 +30,8 @@ int unpack_socket(struct msghdr* msg);
 struct Message* unpack_message(struct msghdr* msg);
 int send_message(int channel, struct Message* message, struct sockaddr_un* address);
 int receive_message(int channel, struct Message* message, struct sockaddr_un* sender);
-
-bool
-is_fd_transferred(const struct Message* message);
-struct Proxy {
-    int proxy_listener;
-    int input;
-    int output;
-    struct sockaddr_in input_peer;
-    int api;
-    struct sockaddr_un api_address;
-};
+bool is_fd_transferred(const struct Message* message);
+int run_proxy_core(struct Proxy* proxy);
 
 enum Transfer {
     TRANSFER_OK,
@@ -120,12 +122,7 @@ setup_api(const char* path, struct Proxy* proxy) {
 }
 
 int
-setup_proxy(uint16_t from_port, uint16_t to_port, const char* api, struct Proxy* proxy) {
-    if (setup_api(api, proxy) != EXIT_SUCCESS) {
-        fprintf(stderr, "fatal: proxy: API setup failed\n");
-        return EXIT_FAILURE;
-    }
-
+setup_listener(uint16_t from_port, struct Proxy* proxy) {
     proxy->proxy_listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (proxy->proxy_listener == -1) {
         perror("error: unable to allocate socket");
@@ -149,6 +146,15 @@ setup_proxy(uint16_t from_port, uint16_t to_port, const char* api, struct Proxy*
         return EXIT_FAILURE;
     }
 
+    return EXIT_SUCCESS;
+}
+
+int
+accept_client(struct Proxy* proxy) {
+    if (proxy->input) {
+        close(proxy->input);
+    }
+
     socklen_t peer_length = sizeof(proxy->input_peer);
     memset(&proxy->input_peer, 0, peer_length);
     proxy->input = accept(proxy->proxy_listener, (struct sockaddr*)&proxy->input_peer,
@@ -156,6 +162,14 @@ setup_proxy(uint16_t from_port, uint16_t to_port, const char* api, struct Proxy*
     if (proxy->input == -1) {
         perror("error: unable to accept connection");
         return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int
+connect_to_server(struct Proxy* proxy) {
+    if (proxy->output) {
+        close(proxy->output);
     }
 
     proxy->output = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -168,16 +182,50 @@ setup_proxy(uint16_t from_port, uint16_t to_port, const char* api, struct Proxy*
     memset(&target, 0, sizeof(target));
     target.sin_family = AF_INET;
     target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    target.sin_port = htons(to_port);
+    target.sin_port = htons(proxy->to_port);
 
-    puts("connecting");
+    int result = -1;
+    do {
+        fprintf(stderr, "info: connecting to server...\n");
+        result = connect(proxy->output, (struct sockaddr*)&target, sizeof(target));
+        if (result < 0) {
+            if (errno == ECONNREFUSED) {
+                sleep(1);
+                result = 0;
+                continue;
+            }
+            perror("error: connect");
+            return EXIT_FAILURE;
+        }
+    } while (result != 0);
+    return EXIT_SUCCESS;
+}
 
-    if (connect(proxy->output, (struct sockaddr*)&target, sizeof(target)) < 0) {
-        perror("error: connect");
+int
+setup_proxy(uint16_t from_port, uint16_t to_port, const char* api, struct Proxy* proxy) {
+    memset(proxy, 0, sizeof(*proxy));
+    proxy->from_port = from_port;
+    proxy->to_port = to_port;
+
+    if (setup_api(api, proxy) != EXIT_SUCCESS) {
+        fprintf(stderr, "fatal: proxy: API setup failed\n");
         return EXIT_FAILURE;
     }
 
-    puts("connected");
+    if (setup_listener(from_port, proxy) != EXIT_SUCCESS) {
+        fprintf(stderr, "fatal: proxy: listener setup failed\n");
+        return EXIT_FAILURE;
+    }
+
+    if (accept_client(proxy) != 0) {
+        fprintf(stderr, "fatal: proxy: failed to connect to server\n");
+        return EXIT_FAILURE;
+    }
+
+    if (connect_to_server(proxy) != 0) {
+        fprintf(stderr, "fatal: proxy: failed to connect to server\n");
+        return EXIT_FAILURE;
+    }
 
     return EXIT_SUCCESS;
 }
@@ -244,7 +292,13 @@ serve_api(struct Proxy* proxy) {
     return EXIT_SUCCESS;
 }
 
-int
+enum ProxyStatus {
+    PROXY_CLIENT_CLOSED,
+    PROXY_SERVER_CLOSED,
+    PROXY_ERROR
+};
+
+enum ProxyStatus
 proxy_data(struct Proxy* proxy) {
     const int COUNT = 3;
     struct pollfd polled[COUNT];
@@ -263,29 +317,32 @@ proxy_data(struct Proxy* proxy) {
                 socklen_t error_size = sizeof(error);
                 getsockopt(polled[i].fd, SOL_SOCKET, SO_ERROR, &error, &error_size);
                 fprintf(stderr, "error: %s (%d)", strerror(error), error);
-                return EXIT_FAILURE;
+                return PROXY_ERROR;
             }
             if (polled[i].revents & POLLIN) {
                 switch (i) {
                 case 0:
-                case 1:
-                    result = transfer_data(polled[i].fd, polled[1 - i].fd);
-                    if (result != 0) {
-                        return result;
+                case 1: {
+                    enum Transfer result = transfer_data(polled[i].fd, polled[1 - i].fd);
+                    switch (result) {
+                    case TRANSFER_FAILED:
+                        return PROXY_ERROR;
+                    case TRANSFER_CLOSED:
+                        if (i == 0) {
+                            return PROXY_CLIENT_CLOSED;
+                        }
+                        return PROXY_SERVER_CLOSED;
                     }
                     break;
+                }
                 case 2:
-                    result = serve_api(proxy);
+                    serve_api(proxy);
                     break;
                 }
             }
         }
     }
-
-    if (result < 0) {
-        return EXIT_FAILURE;
-    }
-    return EXIT_SUCCESS;
+    return PROXY_ERROR;
 }
 
 enum Transfer
@@ -318,6 +375,28 @@ transfer_data(int from, int to) {
 }
 
 int
+run_proxy_core(struct Proxy* proxy) {
+    while (true) {
+        switch (proxy_data(proxy)) {
+        case PROXY_CLIENT_CLOSED:
+            if (accept_client(proxy) != 0) {
+                return EXIT_FAILURE;
+            }
+            continue;
+        case PROXY_SERVER_CLOSED:
+            if (connect_to_server(proxy) != 0) {
+                return EXIT_FAILURE;
+            }
+            continue;
+        case PROXY_ERROR:
+            teardown_proxy(proxy);
+            return EXIT_FAILURE;
+        }
+    }
+    return EXIT_SUCCESS;
+}
+
+int
 run_proxy(int argc, const char** argv) {
     if (argc != 5) {
         return run_diagnostic(argv[0]);
@@ -337,8 +416,8 @@ run_proxy(int argc, const char** argv) {
         fprintf(stderr, "fatal: failed to setup proxy\n");
         return EXIT_FAILURE;
     }
-    proxy_data(&proxy);
-    teardown_proxy(&proxy);
+
+    return run_proxy_core(&proxy);
 }
 
 int
@@ -539,7 +618,7 @@ run_update(int argc, const char** argv) {
 
     fprintf(stderr, "info: restoring operations\n");
     setup_api(api_path, &proxy);
-    proxy_data(&proxy);
+    run_proxy_core(&proxy);
     teardown_proxy(&proxy);
     return EXIT_SUCCESS;
 }
