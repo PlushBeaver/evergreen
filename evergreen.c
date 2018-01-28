@@ -10,6 +10,8 @@
 #include <poll.h>
 #include <stdbool.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/fcntl.h>
 
 struct Proxy {
     uint16_t from_port;
@@ -46,10 +48,10 @@ enum Type {
 
 enum Command {
     COMMAND_GET_PID,
-    COMMAND_GET_API,
     COMMAND_GET_LISTENER,
     COMMAND_GET_INPUT,
     COMMAND_GET_OUTPUT,
+    COMMAND_GET_PORTS,
     COMMAND_SHUDOWN
 };
 
@@ -63,6 +65,10 @@ struct Message {
             int input;
             int output;
             int fd;
+        };
+        struct {
+            uint16_t from_port;
+            uint16_t to_port;
         };
     };
 };
@@ -167,6 +173,94 @@ accept_client(struct Proxy* proxy) {
 }
 
 int
+set_blocking(int fd, bool blocking) {
+    int flags = fcntl(fd, F_GETFL, NULL);
+    if (flags < 0) {
+        perror("fcntlF_GETFL)");
+        return -1;
+    }
+
+    if (blocking) {
+        flags &= ~O_NONBLOCK;
+    }
+    else {
+        flags |= O_NONBLOCK;
+    }
+
+    if (fcntl(fd, F_SETFL, flags) < 0) {
+        perror("fcntl(F_SETFL)");
+        return -1;
+    }
+
+    return 0;
+}
+
+int
+get_socket_error(int fd) {
+    int error = 0;
+    socklen_t length = sizeof(error);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length) < 0) {
+        return -1;
+    }
+    return error;
+}
+
+enum ConnectStatus {
+    CONNECT_SUCCEEDED,
+    CONNECT_FAILED,
+    CONNECT_LATER
+};
+
+enum ConnectStatus
+connect_with_timeout(int fd, struct sockaddr* address, socklen_t address_lngth,
+        struct timeval timeout) {
+    if (set_blocking(fd, false) < 0) {
+        return CONNECT_FAILED;
+    }
+
+    if (connect(fd, address, address_lngth) < 0) {
+        if ((errno == ECONNABORTED) || (errno == ECONNREFUSED)) {
+            return CONNECT_LATER;
+        }
+
+        if (errno != EINPROGRESS) {
+            perror("connect");
+            return CONNECT_FAILED;
+        }
+
+        const int timeout_ms = timeout.tv_sec * 1000 + timeout.tv_usec / 1000;
+
+        struct pollfd poller;
+        poller.fd = fd;
+        poller.events = POLLOUT;
+        poller.revents = 0;
+
+        int result = poll(&poller, 1, timeout_ms);
+
+        if ((result < 0) && (errno != EINTR)) {
+            perror("poll");
+            return CONNECT_FAILED;
+        }
+
+        if (result == 0) {
+            fprintf(stderr, "warning: connection timed out\n");
+            return CONNECT_LATER;
+        }
+
+        const int error = get_socket_error(fd);
+        if (error != 0) {
+            fprintf(stderr, "error: connect: %d = %s\n", error, strerror(error));
+            return CONNECT_LATER;
+        }
+    }
+
+    if (set_blocking(fd, true) < 0) {
+        return CONNECT_FAILED;
+    }
+    return CONNECT_SUCCEEDED;
+}
+
+int
 connect_to_server(struct Proxy* proxy) {
     if (proxy->output) {
         close(proxy->output);
@@ -184,20 +278,25 @@ connect_to_server(struct Proxy* proxy) {
     target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     target.sin_port = htons(proxy->to_port);
 
-    int result = -1;
+    struct timeval timeout;
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+
+    enum ConnectStatus result = CONNECT_FAILED;
     do {
         fprintf(stderr, "info: connecting to server...\n");
-        result = connect(proxy->output, (struct sockaddr*)&target, sizeof(target));
-        if (result < 0) {
-            if (errno == ECONNREFUSED) {
-                sleep(1);
-                result = 0;
-                continue;
-            }
-            perror("error: connect");
+        result = connect_with_timeout(proxy->output, (struct sockaddr*)&target,
+                sizeof(target), timeout);
+        if (result == CONNECT_FAILED) {
+            fprintf(stderr, "error: failed to connect to server\n");
             return EXIT_FAILURE;
         }
-    } while (result != 0);
+        else if (result == CONNECT_LATER) {
+            sleep(timeout.tv_sec);
+        }
+    } while (result != CONNECT_SUCCEEDED);
+    fprintf(stderr, "info: connected to server\n");
+
     return EXIT_SUCCESS;
 }
 
@@ -263,6 +362,10 @@ handle_request(struct Proxy* proxy, struct Message* message) {
     case COMMAND_GET_OUTPUT:
         message->output = proxy->output;
         break;
+    case COMMAND_GET_PORTS:
+        message->from_port = proxy->from_port;
+        message->to_port = proxy->to_port;
+        break;
     case COMMAND_SHUDOWN:
         teardown_proxy(proxy);
         exit(EXIT_SUCCESS);
@@ -313,10 +416,11 @@ proxy_data(struct Proxy* proxy) {
     while ((result = poll(polled, COUNT, -1)) > 0) {
         for (int i = 0; i < COUNT; i++) {
             if (polled[i].revents & POLLERR) {
-                int error = EXIT_SUCCESS;
-                socklen_t error_size = sizeof(error);
-                getsockopt(polled[i].fd, SOL_SOCKET, SO_ERROR, &error, &error_size);
-                fprintf(stderr, "error: %s (%d)", strerror(error), error);
+                int error = get_socket_error(polled[i].fd);
+                fprintf(stderr, "error: %s (%d)\n", strerror(error), error);
+                if (error == ECONNREFUSED) {
+                    return (i == 0) ? PROXY_CLIENT_CLOSED : PROXY_SERVER_CLOSED;
+                }
                 return PROXY_ERROR;
             }
             if (polled[i].revents & POLLIN) {
@@ -582,9 +686,18 @@ run_update(int argc, const char** argv) {
     proxy.input = request_fd(api, &address, COMMAND_GET_INPUT, &message);
     proxy.output = request_fd(api, &address, COMMAND_GET_OUTPUT, &message);
 
+    message.type = MESSAGE_REQUEST;
+    message.command = COMMAND_GET_PORTS;
+    send_message(api, &message, &address);
+    receive_message(api, &message, NULL);
+    proxy.from_port = message.from_port;
+    proxy.to_port = message.to_port;
+
     fprintf(stderr, "debug: update: proxy_listener=%d\n", proxy.proxy_listener);
     fprintf(stderr, "debug: update: input=%d\n", proxy.input);
     fprintf(stderr, "debug: update: output=%d\n", proxy.output);
+    fprintf(stderr, "debug: update: from_port=%d\n", proxy.from_port);
+    fprintf(stderr, "debug: update: to_port=%d\n", proxy.to_port);
 
     struct sockaddr_in proxy_address;
     socklen_t proxy_address_length = sizeof(proxy_address);
