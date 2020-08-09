@@ -176,7 +176,7 @@ int
 set_blocking(int fd, bool blocking) {
     int flags = fcntl(fd, F_GETFL, NULL);
     if (flags < 0) {
-        perror("fcntlF_GETFL)");
+        perror("fcntl(F_GETFL)");
         return -1;
     }
 
